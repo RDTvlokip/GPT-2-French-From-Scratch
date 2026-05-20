@@ -1,0 +1,28 @@
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# Tokenizers
+tokenizers>=0.13.0
+
+# Data processing
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Configuration
+pyyaml>=6.0
+
+# Progress bars
+tqdm>=4.65.0
+
+# Optional: Weights & Biases for experiment tracking
+# wandb>=0.15.0
+
+# Optional: Flash Attention for faster training (requires CUDA)
+# flash-attn>=2.0.0
+
+# Development tools
+black>=23.0.0
+flake8>=6.0.0
+pytest>=7.3.0
