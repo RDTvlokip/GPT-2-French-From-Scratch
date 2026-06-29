@@ -18,6 +18,15 @@ from typing import Dict
 import yaml
 from tqdm import tqdm
 
+# Force UTF-8 on the console so progress symbols (✓ ✗ →) and French accents
+# print correctly on Windows (cp1252) instead of crashing or showing "�".
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
 # Ensure project paths are available (works from root or src/)
 PROJECT_ROOT = Path(__file__).parent.parent
 SRC_DIR = Path(__file__).parent
@@ -32,19 +41,10 @@ from torch.amp import autocast, GradScaler
 
 from model.gpt2 import GPT2, GPT2Config
 
-# Dashboard integration (optional - non-critical)
-try:
-    from dashboard.integration import log_training_step
-    DASHBOARD_AVAILABLE = True
-    print("[Dashboard] Integration loaded successfully")
-except Exception as e:
-    DASHBOARD_AVAILABLE = False
-    log_training_step = None
-    print(f"[Dashboard] Integration not available: {e}")
 
 
 def compute_gradient_stats(model):
-    """Compute gradient statistics for dashboard monitoring."""
+    """Compute the global gradient L2 norm (logged per epoch in metrics.csv)."""
     total_norm = 0.0
     count = 0
     for p in model.parameters():
@@ -59,18 +59,31 @@ def compute_gradient_stats(model):
 class TokenDataset(Dataset):
     """Dataset for tokenized sequences."""
 
-    def __init__(self, data_path: str):
+    def __init__(self, data_path: str, fraction: float = 1.0, seed: int = 42):
         """
         Initialize dataset.
 
         Args:
             data_path: Path to .pt file containing tokenized data
+            fraction: Fraction of blocks to keep (1.0 = all). A random subset is
+                drawn with a fixed seed for reproducible quick test runs.
+            seed: RNG seed used when fraction < 1.0.
         """
         if not os.path.exists(data_path):
             raise FileNotFoundError(f"Data file not found: {data_path}")
 
         self.data = torch.load(data_path, weights_only=True)
-        print(f"Loaded dataset from {data_path}")
+
+        if fraction < 1.0:
+            n_total = len(self.data)
+            n_keep = max(1, int(n_total * fraction))
+            g = torch.Generator().manual_seed(seed)
+            idx = torch.randperm(n_total, generator=g)[:n_keep]
+            self.data = self.data[idx]
+            print(f"Loaded dataset from {data_path} (subset {fraction:.0%}: "
+                  f"{n_keep:,}/{n_total:,} blocks)")
+        else:
+            print(f"Loaded dataset from {data_path}")
         print(f"Shape: {self.data.shape}")
 
     def __len__(self) -> int:
@@ -86,6 +99,44 @@ class TokenDataset(Dataset):
         return self.data[idx]
 
 
+class _Tee:
+    """Duplicate a stream to a log file (so console output is also saved).
+
+    Wraps sys.stdout/sys.stderr: everything printed still shows on the console
+    AND is appended to the run's .log file. No need to copy-paste logs anymore.
+    """
+
+    def __init__(self, stream, log_file):
+        self.stream = stream
+        self.log_file = log_file
+
+    def write(self, data):
+        # Never let a console encoding issue (e.g. cp1252 can't encode '✓' or
+        # '→') crash training. Fall back to an ASCII-safe version on the console;
+        # the log file is UTF-8 so it always keeps the original text.
+        try:
+            self.stream.write(data)
+        except UnicodeEncodeError:
+            enc = getattr(self.stream, "encoding", "ascii") or "ascii"
+            self.stream.write(data.encode(enc, errors="replace").decode(enc))
+        try:
+            self.log_file.write(data)
+            self.log_file.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        self.stream.flush()
+        try:
+            self.log_file.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        # Delegate anything else (encoding, isatty, ...) to the real stream.
+        return getattr(self.stream, name)
+
+
 class Trainer:
     """GPT-2 Trainer with modern optimizations."""
 
@@ -98,10 +149,33 @@ class Trainer:
         """
         self.config = config
         self.device = config["system"]["device"]
+        # Device type ("cuda"/"cpu") for autocast/GradScaler; handles "cuda:0" form
+        self.device_type = torch.device(self.device).type
 
         # Create directories
         os.makedirs(config["logging"]["checkpoint_dir"], exist_ok=True)
         os.makedirs(config["logging"]["log_dir"], exist_ok=True)
+
+        # Automatic logging: each run gets its OWN dated subfolder under log_dir,
+        # holding the full console log and the per-epoch metrics CSV. So runs
+        # never overwrite each other and everything for one run lives together.
+        # The folder name is auto-built from the actual run params (vocab,
+        # param count, epochs, % of data) so it always matches reality.
+        log_dir = Path(config["logging"]["log_dir"])
+        run_name = self._build_run_name(config)
+        stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+        self._run_log_dir = log_dir / f"{stamp}_{run_name}"
+        os.makedirs(self._run_log_dir, exist_ok=True)
+
+        self._log_fh = open(self._run_log_dir / "console.log", "w", encoding="utf-8")
+        sys.stdout = _Tee(sys.stdout, self._log_fh)
+        sys.stderr = _Tee(sys.stderr, self._log_fh)
+
+        self._metrics_path = self._run_log_dir / "metrics.csv"
+        with open(self._metrics_path, "w", encoding="utf-8") as f:
+            f.write("epoch,train_loss,val_loss,perplexity,learning_rate,epoch_time,grad_norm\n")
+        print(f"[Logging] Run folder -> {self._run_log_dir}")
+        print(f"[Logging]   console.log + metrics.csv")
 
         # Initialize model
         print("Initializing model...")
@@ -121,9 +195,14 @@ class Trainer:
             print("Compiling model with torch.compile...")
             self.model = torch.compile(self.model)
 
-        # Initialize datasets
+        # Initialize datasets. data_fraction < 1.0 trains on a random subset
+        # (for fast validation runs); validation always uses the full set.
         print("\nLoading datasets...")
-        self.train_dataset = TokenDataset(config["data"]["train_data"])
+        data_fraction = float(config["data"].get("data_fraction", 1.0))
+        seed = config["training"].get("seed", 42)
+        self.train_dataset = TokenDataset(
+            config["data"]["train_data"], fraction=data_fraction, seed=seed
+        )
         self.val_dataset = TokenDataset(config["data"]["val_data"])
 
         # Initialize dataloaders
@@ -192,7 +271,7 @@ class Trainer:
 
         # Mixed precision scaler
         self.use_fp16 = config["training"].get("use_fp16", False)
-        self.scaler = GradScaler(device='cuda') if self.use_fp16 else None
+        self.scaler = GradScaler(device=str(self.device)) if self.use_fp16 else None
 
         # Training state
         self.global_step = 0
@@ -265,7 +344,7 @@ class Trainer:
             attention_mask = (1.0 - attention_mask.float()) * -1e9
 
             # Forward pass with mixed precision
-            with autocast(device_type='cuda', enabled=self.use_fp16):
+            with autocast(device_type=self.device_type, enabled=self.use_fp16):
                 output = self.model(batch, labels=batch, attention_mask=attention_mask)
                 logits, loss, hidden_states = output[0], output[1], output[2]
 
@@ -317,9 +396,13 @@ class Trainer:
                 "step": f"{self.global_step}/{self.total_steps}",
             }
 
-            # Add GPU memory if CUDA available
+            # Add GPU memory if CUDA available. Report the PEAK reserved memory
+            # (what PyTorch actually holds from the driver, close to nvidia-smi),
+            # not memory_allocated() which only counts live tensors at this
+            # instant and badly under-reports real usage.
             if torch.cuda.is_available():
-                postfix_dict["gpu"] = f"{torch.cuda.memory_allocated() / 1e9:.1f}GB"
+                peak_gb = torch.cuda.max_memory_reserved() / 1e9
+                postfix_dict["gpu"] = f"{peak_gb:.1f}GB"
 
             pbar.set_postfix(postfix_dict)
 
@@ -353,7 +436,7 @@ class Trainer:
             attention_mask = (batch != self.pad_token_id).unsqueeze(1).unsqueeze(2)
             attention_mask = (1.0 - attention_mask.float()) * -1e9
 
-            with autocast(device_type='cuda', enabled=self.use_fp16):
+            with autocast(device_type=self.device_type, enabled=self.use_fp16):
                 output = self.model(batch, labels=batch, attention_mask=attention_mask)
                 logits, loss, hidden_states = output[0], output[1], output[2]
 
@@ -368,6 +451,37 @@ class Trainer:
             })
 
         return total_loss / num_batches
+
+    @staticmethod
+    def _build_run_name(config: dict) -> str:
+        """Build a self-describing run name from the actual run parameters.
+
+        Format: gpt_<vocab>_<params>_<epochs>epochs_<pct>data_v1
+        e.g. gpt_32k_15m_6epochs_60data_v1
+        """
+        m = config["model"]
+        vocab = m["vocab_size"]
+        vocab_str = f"{vocab // 1000}k" if vocab % 1000 == 0 else str(vocab)
+
+        # Estimate parameter count from the config (tied embeddings: the
+        # vocab/embedding matrix is counted once). This matches GPT2.get_num_params
+        # closely enough for a label.
+        n_embd, n_layer = m["n_embd"], m["n_layer"]
+        n_inner = m.get("n_inner", 4 * n_embd)
+        # per-layer: attention (~4 * n_embd^2) + MLP (~2 * n_embd * n_inner)
+        per_layer = 4 * n_embd * n_embd + 2 * n_embd * n_inner
+        embed = vocab * n_embd  # tied with lm_head, counted once
+        total = embed + n_layer * per_layer
+        if total >= 1_000_000:
+            params_str = f"{round(total / 1_000_000)}m"
+        else:
+            params_str = f"{round(total / 1000)}k"
+
+        epochs = config["training"]["num_epochs"]
+        frac = config["data"].get("data_fraction", 1.0)
+        pct = round(frac * 100)
+
+        return f"gpt_{vocab_str}_{params_str}_{epochs}epochs_{pct}data_v1"
 
     def save_checkpoint(self, epoch: int, is_best: bool = False):
         """
@@ -384,13 +498,15 @@ class Trainer:
         if is_best:
             best_path = checkpoint_dir / "best_model.pt"
             self.model.save_pretrained(str(best_path))
+            # Also keep a copy alongside this run's logs/metrics, so each run
+            # folder is self-contained (model + console.log + metrics.csv).
+            self.model.save_pretrained(str(self._run_log_dir / "best_model.pt"))
             # No print here - we print in the train() method with more context
 
         # Save intermediate checkpoint
         if save_interval_epochs and epoch % save_interval_epochs == 0:
             checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch}.pt"
             self.model.save_pretrained(str(checkpoint_path))
-            # print(f"✓ Saved intermediate checkpoint: {checkpoint_path.name}")
 
 
     def train(self):
@@ -427,29 +543,15 @@ class Trainer:
             print(f"Epoch Time:      {epoch_time:.1f}s")
             print(f"Best Val Loss:   {self.best_val_loss:.4f} (Epoch {self.best_epoch})")
 
-            # Log to dashboard every epoch
-            if DASHBOARD_AVAILABLE and log_training_step:
-                try:
-                    current_lr = self.scheduler.get_last_lr()[0]
-                    gradient_norm = compute_gradient_stats(self.model)
-                    log_training_step(
-                        epoch=epoch + 1,
-                        train_loss=train_loss,
-                        val_loss=val_loss,
-                        perplexity=perplexity,
-                        learning_rate=current_lr,
-                        epoch_time=epoch_time,
-                        gradient_norm=gradient_norm
-                    )
-                except Exception as e:
-                    print(f"[Dashboard] Logging error (non-critical): {e}")
-
-                # Update training data projection every epoch for real-time dashboard updates
-                try:
-                    from dashboard.training_hooks import save_training_data_projection
-                    save_training_data_projection(self.model, train_data_path="data/train.pt", sample_size=1000)
-                except Exception as e:
-                    print(f"[Dashboard] Training data projection update skipped (non-critical): {e}")
+            # Append structured metrics row (for plotting / comparing runs).
+            current_lr = self.scheduler.get_last_lr()[0]
+            grad_norm = compute_gradient_stats(self.model)
+            try:
+                with open(self._metrics_path, "a", encoding="utf-8") as f:
+                    f.write(f"{epoch + 1},{train_loss:.6f},{val_loss:.6f},"
+                            f"{perplexity:.4f},{current_lr:.6e},{epoch_time:.1f},{grad_norm:.4f}\n")
+            except Exception as e:
+                print(f"[Logging] Metrics write skipped (non-critical): {e}")
 
             if val_loss < self.best_val_loss:
                 improvement = self.best_val_loss - val_loss
@@ -502,19 +604,62 @@ class Trainer:
         print(f"Best model: Epoch {self.best_epoch} with val_loss={self.best_val_loss:.4f}")
         print(f"Best model saved at: {Path(self.config['logging']['checkpoint_dir']) / 'best_model.pt'}")
         print(f"Final model saved at: {final_path}")
+        print(f"Logs & metrics:      {self._run_log_dir}")
         print("=" * 80 + "\n")
+
+        # Restore original streams and close the log file handle.
+        self._close_logging()
+
+    def _close_logging(self):
+        """Restore stdout/stderr and close the run log file."""
+        if isinstance(sys.stdout, _Tee):
+            sys.stdout = sys.stdout.stream
+        if isinstance(sys.stderr, _Tee):
+            sys.stderr = sys.stderr.stream
+        try:
+            self._log_fh.close()
+        except Exception:
+            pass
 
 
 def main():
     """Main entry point."""
+    import argparse
+    parser = argparse.ArgumentParser(description="Train GPT-2 from scratch")
+    parser.add_argument(
+        "--data-fraction", type=float, default=None,
+        help="Fraction of training blocks to use (e.g. 0.2 for a fast test "
+             "run). Overrides data.data_fraction in the config.",
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=None,
+        help="Override training.num_epochs (e.g. 1 for a quick run).",
+    )
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help="Path to a config YAML (default: config/gpt2_config.yaml).",
+    )
+    args = parser.parse_args()
+
     # Load config (works from root or src/)
-    config_path = PROJECT_ROOT / "config" / "gpt2_config.yaml"
+    if args.config:
+        config_path = Path(args.config)
+        if not config_path.is_absolute():
+            config_path = PROJECT_ROOT / args.config
+    else:
+        config_path = PROJECT_ROOT / "config" / "gpt2_config.yaml"
 
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
+
+    # CLI overrides (take precedence over the config file)
+    if args.data_fraction is not None:
+        config["data"]["data_fraction"] = args.data_fraction
+    if args.epochs is not None:
+        config["training"]["num_epochs"] = args.epochs
 
     # Set device
     if config["system"]["device"] == "cuda" and not torch.cuda.is_available():

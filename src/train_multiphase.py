@@ -46,14 +46,6 @@ from curriculum import (
     mean_pool,
 )
 
-# Dashboard integration (optional)
-try:
-    from dashboard.integration import log_training_step
-    DASHBOARD_AVAILABLE = True
-except Exception:
-    DASHBOARD_AVAILABLE = False
-    log_training_step = None
-
 
 class TokenDataset(Dataset):
     """Dataset for tokenized sequences."""
@@ -452,21 +444,6 @@ class MultiPhaseTrainer:
 
                 print(f"\n  Epoch {global_epoch}/{self.total_epochs} ({phase_name})")
                 print(f"  Train loss: {train_loss:.4f}  |  Val loss: {val_loss:.4f}  |  PPL: {ppl:.2f}  |  Time: {elapsed:.0f}s")
-
-                # Dashboard
-                if DASHBOARD_AVAILABLE and log_training_step:
-                    try:
-                        log_training_step(
-                            epoch=global_epoch,
-                            train_loss=train_loss,
-                            val_loss=val_loss,
-                            perplexity=ppl,
-                            learning_rate=self.scheduler.get_last_lr()[0],
-                            epoch_time=elapsed,
-                            gradient_norm=0.0,
-                        )
-                    except Exception:
-                        pass
 
                 # Early stopping
                 if val_loss < self.best_val_loss:

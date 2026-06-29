@@ -18,6 +18,15 @@ import numpy as np
 
 import torch
 
+# Force UTF-8 on stdout/stderr so accented French (é, è, à, ç) prints correctly
+# on Windows consoles (which default to cp1252 and mangle them into "�").
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
 # Ensure we're working from project root
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -25,16 +34,6 @@ os.chdir(PROJECT_ROOT)
 
 from model.gpt2 import GPT2
 from utils.tokenizer import GPT2Tokenizer
-
-# Dashboard integration (optional - non-critical)
-try:
-    from dashboard.integration import log_generation
-    DASHBOARD_AVAILABLE = True
-    print("[Dashboard] Integration loaded successfully")
-except Exception as e:
-    DASHBOARD_AVAILABLE = False
-    log_generation = None
-    print(f"[Dashboard] Integration not available: {e}")
 
 
 class TextGenerator:
@@ -86,7 +85,7 @@ class TextGenerator:
         top_p: Optional[float] = None,
         repetition_penalty: Optional[float] = None,
         do_sample: Optional[bool] = None,
-        log_to_dashboard: bool = True,
+        no_new_doc: bool = True,
     ) -> str:
         """
         Generate text from prompt with streaming token-by-token output.
@@ -99,7 +98,6 @@ class TextGenerator:
             top_p: Nucleus sampling
             repetition_penalty: Penalty for repeating tokens
             do_sample: Whether to sample or use greedy
-            log_to_dashboard: Whether to log generation to dashboard for visualization
 
         Returns:
             Generated text (same as non-streaming but displayed progressively)
@@ -114,18 +112,17 @@ class TextGenerator:
         )
         do_sample = do_sample if do_sample is not None else self.gen_config.get("do_sample", True)
 
-        # Encode prompt
+        # Encode prompt. We add <bos> (a document start) but must NOT keep the
+        # trailing <eos>: the prompt isn't finished, we want to CONTINUE it. A
+        # trailing <eos> tells the model the doc is over, so it starts a brand
+        # new one ("# New title") and drops the topic.
         input_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
+        if input_ids and input_ids[-1] == self.tokenizer.eos_token_id:
+            input_ids = input_ids[:-1]
         input_ids = torch.tensor([input_ids], dtype=torch.long, device=self.device)
 
         print(f"\nGenerating...\n")
         print(prompt, end="", flush=True)
-
-        # Data collection for dashboard
-        all_tokens = []
-        all_probs = []
-        all_embeddings = []
-        all_attention_per_layer = [None for _ in range(len(self.model.transformer.h))]
 
         # Generate token by token
         for _ in range(max_length):
@@ -138,31 +135,25 @@ class TextGenerator:
             # Get model output
             model_output = self.model(input_ids_cond)
             logits = model_output[0]  # First output is logits
-            hidden_states = model_output[2] if len(model_output) > 2 else None  # Third is hidden states
-
-            # Capture hidden states for embedding projection
-            if hidden_states is not None:
-                # Get embedding of last token (shape: [batch_size, emb_dim])
-                last_hidden = hidden_states[:, -1, :].cpu().detach().numpy().flatten()
-                all_embeddings.append(last_hidden)
-
-            # Capture attention weights from all layers (store the last complete one)
-            # These get overwritten each iteration; we'll save the final one
-            for layer_idx, layer in enumerate(self.model.transformer.h):
-                att_weights = getattr(layer.attn, '_last_attention_weights', None)
-                if att_weights is not None:
-                    # Shape: (batch, num_heads, seq_len, seq_len)
-                    # Average over heads to get (batch, seq_len, seq_len)
-                    att_avg = att_weights.mean(dim=1)[0, :, :].cpu().numpy()
-                    all_attention_per_layer[layer_idx] = att_avg.tolist()
 
             # Get logits for last position
             logits = logits[:, -1, :] / temperature
 
-            # Apply repetition penalty
+            # Prevent the model from starting a NEW document mid-generation.
+            # Document packing taught it that text is often followed by
+            # <bos> (start of next doc) + a new "# Title", which makes it
+            # drop the current topic. Banning <bos> keeps it on-subject while
+            # still allowing in-document ## section headings.
+            if no_new_doc:
+                logits[:, self.tokenizer.bos_token_id] = float("-inf")
+
+            # Apply repetition penalty (HF semantics: divide positive logits,
+            # multiply negative ones — both move the token toward less likely).
+            # Dividing a NEGATIVE logit would wrongly make it MORE likely.
             if repetition_penalty != 1.0:
                 for token_id in set(input_ids[0].tolist()):
-                    logits[0, token_id] /= repetition_penalty
+                    v = logits[0, token_id]
+                    logits[0, token_id] = v / repetition_penalty if v > 0 else v * repetition_penalty
 
             # Apply top-k filtering
             if top_k is not None:
@@ -188,23 +179,12 @@ class TextGenerator:
             else:
                 next_token = torch.argmax(probs, dim=-1, keepdim=True)
 
-            # Get probability of selected token
-            next_token_prob = probs[0, next_token.item()].item()
-
             # Append to sequence
             input_ids = torch.cat([input_ids, next_token], dim=1)
 
             # Decode and print the new token (streaming)
             token_text = self.tokenizer.decode([next_token.item()], skip_special_tokens=True)
             print(token_text, end="", flush=True)
-
-            # Collect data for dashboard
-            if log_to_dashboard:
-                all_tokens.append(token_text)
-                all_probs.append({
-                    'token': token_text,
-                    'probability': next_token_prob
-                })
 
             # Stop if EOS token generated
             if next_token.item() == self.tokenizer.eos_token_id:
@@ -214,22 +194,6 @@ class TextGenerator:
 
         # Return complete text
         complete_text = self.tokenizer.decode(input_ids[0].tolist(), skip_special_tokens=True)
-
-        # Log to dashboard if available
-        if log_to_dashboard and DASHBOARD_AVAILABLE and log_generation:
-            try:
-                # Filter out None attention layers
-                attention_weights = [a for a in all_attention_per_layer if a is not None]
-                log_generation(
-                    tokens=all_tokens,
-                    attention_weights=attention_weights if attention_weights else [],
-                    token_probabilities=all_probs,
-                    text=complete_text,
-                    embeddings=all_embeddings if all_embeddings else None
-                )
-            except Exception as e:
-                print(f"[Dashboard] Logging error (non-critical): {e}")
-
         return complete_text
 
     @torch.no_grad()
@@ -411,6 +375,12 @@ def main():
         help="Nucleus sampling (top-p)",
     )
     parser.add_argument(
+        "--repetition_penalty",
+        type=float,
+        default=None,
+        help="Repetition penalty (>1.0 discourages repeats; 1.3 recommended)",
+    )
+    parser.add_argument(
         "--num_sequences",
         type=int,
         default=1,
@@ -421,6 +391,12 @@ def main():
         type=str,
         default="cuda",
         help="Device to run on (cuda/cpu)",
+    )
+    parser.add_argument(
+        "--allow-new-doc",
+        action="store_true",
+        help="Allow the model to emit <bos> (start a new document) mid-"
+             "generation. Off by default: banning <bos> keeps it on-topic.",
     )
 
     args = parser.parse_args()
@@ -452,6 +428,8 @@ def main():
             temperature=args.temperature,
             top_k=args.top_k,
             top_p=args.top_p,
+            repetition_penalty=args.repetition_penalty,
+            no_new_doc=not args.allow_new_doc,
         )
         print("=" * 80)
     else:

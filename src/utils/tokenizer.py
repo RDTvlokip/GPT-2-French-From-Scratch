@@ -41,7 +41,6 @@ class GPT2Tokenizer:
         # Load tokenizer from file. This correctly loads the model,
         # pre-tokenizer, and decoder settings from the JSON.
         self.tokenizer = Tokenizer.from_file(tokenizer_path)
-        print("Loaded tokenizer using from_file()")
 
         # Get token IDs
         self.pad_token_id = self.tokenizer.token_to_id(pad_token)
@@ -105,21 +104,29 @@ class GPT2Tokenizer:
         Returns:
             Token IDs or list of token IDs
         """
-        # Configure tokenizer
+        # Configure tokenizer. These settings are global on the underlying
+        # tokenizer, so we restore them after encoding to avoid leaking state
+        # into later calls (e.g. batched encoding inflating token counts).
         if max_length is not None:
             self.tokenizer.enable_truncation(max_length=max_length)
         if padding and max_length is not None:
             self.tokenizer.enable_padding(length=max_length, pad_id=self.pad_token_id, pad_token=self.pad_token)
 
-        # Single text
-        if isinstance(text, str):
-            encoding = self.tokenizer.encode(text, add_special_tokens=add_special_tokens)
-            return encoding.ids
+        try:
+            # Single text
+            if isinstance(text, str):
+                encoding = self.tokenizer.encode(text, add_special_tokens=add_special_tokens)
+                return encoding.ids
 
-        # Batch of texts
-        else:
-            encodings = self.tokenizer.encode_batch(text, add_special_tokens=add_special_tokens)
-            return [enc.ids for enc in encodings]
+            # Batch of texts
+            else:
+                encodings = self.tokenizer.encode_batch(text, add_special_tokens=add_special_tokens)
+                return [enc.ids for enc in encodings]
+        finally:
+            if max_length is not None:
+                self.tokenizer.no_truncation()
+            if padding and max_length is not None:
+                self.tokenizer.no_padding()
 
     def decode(
             self,

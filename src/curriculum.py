@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, Subset
 
 
-def score_difficulty(data: torch.Tensor, pad_token_id: int = 0) -> torch.Tensor:
+def score_difficulty(data: torch.Tensor, pad_token_id: int = 0, vocab_size: int = 32000) -> torch.Tensor:
     """Score each sample by difficulty (higher = harder).
 
     Difficulty is based on:
@@ -27,6 +27,7 @@ def score_difficulty(data: torch.Tensor, pad_token_id: int = 0) -> torch.Tensor:
     Args:
         data: Token tensor (num_samples, seq_len)
         pad_token_id: Padding token ID
+        vocab_size: Vocabulary size, used to normalize the rarity score
 
     Returns:
         Difficulty scores (num_samples,)
@@ -50,7 +51,7 @@ def score_difficulty(data: torch.Tensor, pad_token_id: int = 0) -> torch.Tensor:
         unique_ratio = len(torch.unique(non_pad)) / length
 
         # Rarity score: mean token ID (BPE puts rare tokens at higher IDs)
-        rarity_score = non_pad.float().mean().item() / 32000.0
+        rarity_score = non_pad.float().mean().item() / vocab_size
 
         # Combined score
         scores[i] = 0.4 * length_score + 0.3 * unique_ratio + 0.3 * rarity_score
@@ -63,6 +64,7 @@ def create_curriculum_subsets(
     data_tensor: torch.Tensor,
     pad_token_id: int = 0,
     num_buckets: int = 5,
+    vocab_size: int = 32000,
 ) -> List[Subset]:
     """Split dataset into difficulty buckets (easy → hard).
 
@@ -71,11 +73,12 @@ def create_curriculum_subsets(
         data_tensor: Raw token tensor
         pad_token_id: Padding token ID
         num_buckets: Number of difficulty levels
+        vocab_size: Vocabulary size, forwarded to score_difficulty
 
     Returns:
         List of Subsets ordered easy → hard
     """
-    scores = score_difficulty(data_tensor, pad_token_id)
+    scores = score_difficulty(data_tensor, pad_token_id, vocab_size)
     sorted_indices = torch.argsort(scores).tolist()
 
     bucket_size = len(sorted_indices) // num_buckets

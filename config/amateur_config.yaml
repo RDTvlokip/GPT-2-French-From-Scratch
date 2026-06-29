@@ -16,10 +16,10 @@ model:
   # Architecture
   vocab_size: 32000
   n_positions: 1024  # Context length
-  n_embd: 256        # Hidden size / embedding dimension
-  n_layer: 8         # Number of transformer blocks (deeper = mieux compréhension)
-  n_head: 4          # Number of attention heads (256/4 = 64 dims per head — propre)
-  n_inner: 1024      # FFN hidden dimension (4x n_embd, ajusté auto pour SwiGLU)
+  n_embd: 128        # AMATEUR: petit (cerveau ridicule, pour le CD)
+  n_layer: 2         # AMATEUR: 2 couches seulement
+  n_head: 8          # 128/8 = 16 dims/head
+  n_inner: 384       # 4x n_embd
 
 # Model parameters : 4.56M
 # model:
@@ -171,8 +171,8 @@ generation:
 logging:
   # Logging and checkpointing
   log_dir: "logs"
-  checkpoint_dir: "models"
-  run_name: "gpt_32k_15m_10epochs_v1"
+  checkpoint_dir: "models_amateur"   # séparé pour ne pas écraser le 15M
+  run_name: "amateur_2m"
 
   # Weights & Biases (optional)
   use_wandb: false

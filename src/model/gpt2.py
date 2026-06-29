@@ -224,8 +224,17 @@ class RotaryPositionEmbedding(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        """Apply rotary embedding: x * cos + rotate_half(x) * sin"""
-        return (x * cos) + (self._rotate_half(x) * sin)
+        """Apply rotary embedding: x * cos + rotate_half(x) * sin
+
+        Computed in float32 for precision (fp16 RoPE drifts on long sequences),
+        then cast back to the input dtype.
+        """
+        orig_dtype = x.dtype
+        x = x.float()
+        cos = cos.float()
+        sin = sin.float()
+        out = (x * cos) + (self._rotate_half(x) * sin)
+        return out.to(orig_dtype)
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -294,14 +303,7 @@ class CausalSelfAttention(nn.Module):
         # Regularization
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
-
-        # Causal mask
-        self.register_buffer(
-            "bias",
-            torch.tril(torch.ones(config.n_positions, config.n_positions)).view(
-                1, 1, config.n_positions, config.n_positions
-            ),
-        )
+        self.attn_pdrop = config.attn_pdrop
 
         # Scaling factor
         self.scale = 1.0 / math.sqrt(self.head_dim)
@@ -382,41 +384,36 @@ class CausalSelfAttention(nn.Module):
             v = self._repeat_kv(v)
 
         S = k.size(2)  # Total sequence length (including cache)
+        is_prefill = past_key_value is None  # T_q == T_k when no cache
 
-        if self.use_flash_attention and not use_cache:
-            # Flash Attention via PyTorch 2.0+ SDPA
-            # ~2x faster, ~4x less VRAM, fused kernel
-            dropout_p = self.attn_dropout.p if self.training else 0.0
+        if self.use_flash_attention:
+            # SDPA (efficient/flash kernel). Works with KV-cache too: SDPA's
+            # is_causal flag assumes T_q == T_k, so we only use it on prefill.
+            # During decode (T_q < T_k) we build an explicit causal mask.
+            dropout_p = self.attn_pdrop if self.training else 0.0
 
-            if attention_mask is None:
-                # No padding mask: use built-in causal flag (most efficient)
+            if attention_mask is None and is_prefill:
+                # Fast path: built-in causal flag, no mask materialized.
                 y = F.scaled_dot_product_attention(
                     q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=True,
                 )
             else:
-                # Padding mask provided: combine with causal mask
-                # attn_mask and is_causal are mutually exclusive in SDPA
-                T_q = q.size(2)
-                T_k = k.size(2)
-                # Causal mask: lower triangular (T_q, T_k)
-                causal = torch.ones(T_q, T_k, device=q.device, dtype=torch.bool).tril(diagonal=T_k - T_q)
-                # Combine: padding mask (additive, -inf for padding) + causal mask (boolean)
-                combined = attention_mask.to(q.dtype) + (~causal).to(q.dtype) * -1e9
+                # Build (T, S) causal mask aligned to the end of the sequence.
+                causal = torch.ones(T, S, device=q.device, dtype=torch.bool).tril(diagonal=S - T)
+                attn_mask = torch.zeros(T, S, device=q.device, dtype=q.dtype)
+                attn_mask.masked_fill_(~causal, float("-inf"))
+                if attention_mask is not None:
+                    attn_mask = attn_mask + attention_mask.to(q.dtype)
                 y = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=combined, dropout_p=dropout_p, is_causal=False,
+                    q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False,
                 )
-            self._last_attention_weights = None  # Not available with flash attention
+            self._last_attention_weights = None  # Not available with fused kernel
         else:
-            # Manual attention (for KV-cache generation or when flash is disabled)
+            # Manual attention (exposes attention weights for inspection)
             att = (q @ k.transpose(-2, -1)) * self.scale  # (B, n_head, T, S)
 
-            # Apply causal mask
-            if past_key_value is not None:
-                causal_mask = torch.ones(T, S, device=x.device, dtype=torch.bool)
-                causal_mask = causal_mask.tril(diagonal=S - T)
-            else:
-                causal_mask = self.bias[:, :, :T, :S].bool()
-
+            # Causal mask aligned to the end (handles both prefill and decode)
+            causal_mask = torch.ones(T, S, device=x.device, dtype=torch.bool).tril(diagonal=S - T)
             att = att.masked_fill(~causal_mask, float("-inf"))
 
             if attention_mask is not None:
@@ -618,6 +615,14 @@ class GPT2(nn.Module):
         # Initialize weights first, then tie (so tying survives init)
         self.apply(self._init_weights)
 
+        # GPT-2 scaled init: shrink the residual output projections by
+        # 1/sqrt(2 * n_layer) so the residual stream variance stays bounded
+        # with depth. Applied to attn output proj and MLP down proj.
+        scale = (2 * config.n_layer) ** -0.5
+        for name, p in self.named_parameters():
+            if name.endswith("c_proj.weight") or name.endswith("down_proj.weight"):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 * scale)
+
         # Weight tying (after init to avoid double-init of the shared tensor)
         self.transformer.wte.weight = self.lm_head.weight
 
@@ -745,6 +750,55 @@ class GPT2(nn.Module):
         return logits, loss, hidden_states, present_key_values
 
     @torch.no_grad()
+    def forward_layer_logits(self, input_ids: torch.Tensor, layers):
+        """Return logits computed from selected intermediate layers (for DoLa).
+
+        For each requested layer index, the layer's hidden state is passed
+        through the final norm + lm_head, giving "early-exit" logits. The final
+        layer's logits are always included under key -1.
+
+        Args:
+            input_ids: (batch, seq_len)
+            layers: iterable of layer indices (0-based) to read hidden states
+                    after. Negative or out-of-range values are ignored.
+
+        Returns:
+            dict {layer_index: logits (batch, seq_len, vocab)}, plus key -1 for
+            the final layer.
+        """
+        device = input_ids.device
+        B, T = input_ids.size()
+        wanted = set(int(l) for l in layers)
+
+        x = self.transformer.wte(input_ids)
+        if "wpe" in self.transformer:
+            position_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+            x = x + self.transformer.wpe(position_ids)
+        else:
+            position_ids = torch.arange(T, device=device).unsqueeze(0)
+        x = self.transformer.drop(x)
+
+        out = {}
+        n_layer = len(self.transformer.h)
+        for i, block in enumerate(self.transformer.h):
+            x, _ = block(
+                x,
+                attention_mask=None,
+                position_ids=position_ids if self.config.use_rope else None,
+                past_key_value=None,
+                use_cache=False,
+            )
+            if i in wanted and i != n_layer - 1:
+                # Project this layer's hidden state with the shared head.
+                h = self.transformer.ln_f(x)
+                out[i] = self.lm_head(h)
+
+        # Final layer logits (always provided, key -1).
+        h = self.transformer.ln_f(x)
+        out[-1] = self.lm_head(h)
+        return out
+
+    @torch.no_grad()
     def generate(
         self,
         input_ids: torch.Tensor,
@@ -801,15 +855,18 @@ class GPT2(nn.Module):
             # Get logits for last position
             logits = logits[:, -1, :] / temperature
 
-            # Apply repetition penalty
+            # Apply repetition penalty (HF semantics: divide positive logits,
+            # multiply negative ones, so both move toward less likely).
+            # Vectorized: gather logits of already-seen tokens, rescale, scatter.
             if repetition_penalty != 1.0:
-                for i in range(input_ids.size(0)):
-                    for token_id in set(input_ids[i].tolist()):
-                        logits[i, token_id] /= repetition_penalty
+                seen = logits.gather(1, input_ids)
+                seen = torch.where(seen > 0, seen / repetition_penalty, seen * repetition_penalty)
+                logits.scatter_(1, input_ids, seen)
 
-            # Top-k filtering
+            # Top-k filtering (clamp k to vocab size to avoid topk error)
             if top_k is not None:
-                indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+                k = min(top_k, logits.size(-1))
+                indices_to_remove = logits < torch.topk(logits, k)[0][..., -1, None]
                 logits[indices_to_remove] = float("-inf")
 
             # Top-p filtering
@@ -855,10 +912,36 @@ class GPT2(nn.Module):
     @classmethod
     def from_pretrained(cls, load_path: str, device: str = "cpu"):
         """Load model checkpoint."""
-        checkpoint = torch.load(load_path, map_location=device, weights_only=False)
+        # weights_only=True blocks arbitrary code execution from a malicious
+        # checkpoint. The only non-tensor object we serialize is GPT2Config
+        # (a dataclass), so we allowlist it explicitly.
+        #
+        # add_safe_globals + weights_only=True only exist on torch >= 2.4.
+        # On older versions we fall back to a plain (trusted) load, since we
+        # only ever load checkpoints we produced ourselves.
+        if hasattr(torch.serialization, "add_safe_globals"):
+            torch.serialization.add_safe_globals([GPT2Config])
+            checkpoint = torch.load(load_path, map_location=device, weights_only=True)
+        else:
+            checkpoint = torch.load(load_path, map_location=device, weights_only=False)
         config = checkpoint["config"]
         model = cls(config)
-        model.load_state_dict(checkpoint["model_state_dict"])
+
+        # Backward compat: older checkpoints stored a per-layer causal mask
+        # buffer "attn.bias" (shape n_positions x n_positions). The mask is now
+        # built on the fly, so these keys are obsolete — drop them before load.
+        state_dict = checkpoint["model_state_dict"]
+        state_dict = {k: v for k, v in state_dict.items() if not k.endswith("attn.bias")}
+
+        # strict=False also tolerates the missing buffers cleanly.
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if unexpected:
+            print(f"Warning: ignored unexpected keys: {unexpected}")
+        # Only the intended obsolete buffers may be "missing"; flag anything else.
+        real_missing = [k for k in missing if not k.endswith("attn.bias")]
+        if real_missing:
+            print(f"Warning: missing keys not initialized from checkpoint: {real_missing}")
+
         model = model.to(device)
         print(f"Model loaded from {load_path} on device: {device}")
         return model

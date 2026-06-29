@@ -1,12 +1,25 @@
-"""Dataset preparation: tokenize, chunk, pad, split.
+"""Dataset preparation: tokenize, pack into full blocks, split.
 
-Memory-efficient (numpy int32 arrays, ~85% RAM saved vs Python lists).
-Parallelized (multiprocessing pool with one tokenizer per worker).
+Strategy: **document packing** (GPT-3 / LLaMA style).
+
+Each document is tokenized with <bos> ... <eos> markers, then ALL documents
+are concatenated into one continuous token stream. That stream is sliced into
+fixed-size blocks of exactly `block_size` tokens — no padding, no arbitrary
+mid-sentence cuts. The <eos> markers teach the model where documents end, so
+it learns long-range coherence and when to stop a topic.
+
+Why this replaces the old overlap-chunking:
+- Old: every doc cut into 450-token slices at arbitrary offsets, padded to 512
+  (~12% wasted padding), with no <bos>/<eos> -> model never saw a whole, clean,
+  delimited document, hence topic drift.
+- New: continuous stream, full blocks, explicit document boundaries, zero pad.
+
+Memory-efficient (numpy int32) and parallelized (one tokenizer per worker).
 
 Pipeline:
-1. Split files into N groups (one per worker)
-2. Each worker: read → tokenize (batch) → chunk → pad → numpy array
-3. Main: concatenate all → shuffle → train/val split → save .pt files
+1. Split files into tasks (one batch of files per worker call)
+2. Each worker: read -> tokenize (with <bos>/<eos>) -> return flat token stream
+3. Main: concatenate all streams -> slice into full blocks -> shuffle -> split
 """
 
 import os
@@ -28,49 +41,24 @@ from src.utils.tokenizer import GPT2Tokenizer
 
 # Globals for worker processes (initialized via Pool initializer)
 _worker_tokenizer = None
-_worker_chunk_size = 450
-_worker_overlap = 50
-_worker_min_chunk_size = 100
-_worker_target_seq_length = 512
-_worker_pad_token_id = 0
 
 
-def chunk_text_with_overlap(
-    text_tokens: List[int],
-    chunk_size: int,
-    overlap: int,
-    min_chunk_size: int,
-) -> List[List[int]]:
-    """Divide tokens into overlapping chunks."""
-    chunks = []
-    stride = chunk_size - overlap
-    for i in range(0, len(text_tokens), stride):
-        chunk = text_tokens[i: i + chunk_size]
-        if len(chunk) >= min_chunk_size:
-            chunks.append(chunk)
-        if i + chunk_size >= len(text_tokens):
-            break
-    return chunks
-
-
-def _init_worker(tokenizer_path, chunk_size, overlap, min_chunk_size,
-                 target_seq_length, pad_token_id):
+def _init_worker(tokenizer_path):
     """Initialize worker process: load tokenizer once."""
-    global _worker_tokenizer, _worker_chunk_size, _worker_overlap
-    global _worker_min_chunk_size, _worker_target_seq_length, _worker_pad_token_id
+    global _worker_tokenizer
     _worker_tokenizer = GPT2Tokenizer(tokenizer_path)
-    _worker_chunk_size = chunk_size
-    _worker_overlap = overlap
-    _worker_min_chunk_size = min_chunk_size
-    _worker_target_seq_length = target_seq_length
-    _worker_pad_token_id = pad_token_id
 
 
 def _process_file_batch(file_paths: List[str]) -> Tuple[np.ndarray, dict]:
-    """Worker: read + tokenize + chunk + pad a batch of files.
+    """Worker: read + tokenize a batch of files into one flat token stream.
+
+    Each document is encoded with special tokens (<bos> ... <eos>) via the
+    tokenizer's post-processor, then all documents in this batch are
+    concatenated. No chunking, no padding here — packing happens in the main
+    process so block boundaries can span across file-batch boundaries.
 
     Returns:
-        (padded_chunks_array, stats_dict)
+        (flat_token_stream, stats_dict)
     """
     texts = []
     total_chars = 0
@@ -86,61 +74,46 @@ def _process_file_batch(file_paths: List[str]) -> Tuple[np.ndarray, dict]:
             continue
 
     if not texts:
-        return np.zeros((0, _worker_target_seq_length), dtype=np.int32), {
+        return np.zeros((0,), dtype=np.int32), {
             "total_chars": 0, "total_tokens": 0, "total_files": 0,
+            "input_files": len(file_paths),
         }
 
-    # Batch tokenization (uses internal Rust parallelism)
+    # Batch tokenization WITH special tokens: post-processor wraps each doc in
+    # <bos> ... <eos>, giving the model explicit document boundaries.
     try:
-        tokens_list = _worker_tokenizer.encode(texts, add_special_tokens=False)
+        tokens_list = _worker_tokenizer.encode(texts, add_special_tokens=True)
     except Exception:
-        tokens_list = [_worker_tokenizer.encode(t, add_special_tokens=False) for t in texts]
+        tokens_list = [_worker_tokenizer.encode(t, add_special_tokens=True) for t in texts]
 
-    # Chunk + pad → numpy
-    padded_chunks = []
-    total_tokens = 0
+    # Flatten all documents of this batch into a single continuous stream.
+    total_tokens = sum(len(t) for t in tokens_list)
+    stream = np.empty(total_tokens, dtype=np.int32)
+    pos = 0
     for tokens in tokens_list:
-        total_tokens += len(tokens)
-        chunks = chunk_text_with_overlap(
-            tokens,
-            chunk_size=_worker_chunk_size,
-            overlap=_worker_overlap,
-            min_chunk_size=_worker_min_chunk_size,
-        )
-        for chunk in chunks:
-            if len(chunk) >= _worker_target_seq_length:
-                padded = chunk[:_worker_target_seq_length]
-            else:
-                padded = chunk + [_worker_pad_token_id] * (_worker_target_seq_length - len(chunk))
-            padded_chunks.append(padded)
+        n = len(tokens)
+        stream[pos:pos + n] = tokens
+        pos += n
 
-    if padded_chunks:
-        arr = np.array(padded_chunks, dtype=np.int32)
-    else:
-        arr = np.zeros((0, _worker_target_seq_length), dtype=np.int32)
-
-    return arr, {
+    return stream, {
         "total_chars": total_chars,
         "total_tokens": total_tokens,
         "total_files": len(texts),
+        "input_files": len(file_paths),
     }
 
 
 def process_all_files(
     data_dir: str,
     tokenizer_path: str,
-    chunk_size: int = 450,
-    overlap: int = 50,
-    min_chunk_size: int = 100,
-    target_seq_length: int = 512,
-    pad_token_id: int = 0,
+    block_size: int = 1024,
     num_workers: int = None,
     files_per_task: int = 200,
 ) -> Tuple[np.ndarray, dict]:
-    """Parallel tokenization + chunking + padding.
+    """Parallel tokenization + document packing into full blocks.
 
     Returns:
-        (all_padded_chunks, stats)
+        (blocks, stats) where blocks has shape (num_blocks, block_size)
     """
     data_path = Path(data_dir)
     if not data_path.exists():
@@ -155,6 +128,7 @@ def process_all_files(
 
     print(f"Found {len(txt_files):,} .txt files")
     print(f"Workers: {num_workers}  |  files/task: {files_per_task}")
+    print(f"Block size: {block_size} tokens (full blocks, no padding)")
     print()
 
     # Split into tasks
@@ -163,7 +137,7 @@ def process_all_files(
         for i in range(0, len(txt_files), files_per_task)
     ]
 
-    chunk_arrays: List[np.ndarray] = []
+    stream_parts: List[np.ndarray] = []
     total_chars = 0
     total_tokens = 0
     total_files = 0
@@ -171,86 +145,97 @@ def process_all_files(
     with Pool(
         processes=num_workers,
         initializer=_init_worker,
-        initargs=(tokenizer_path, chunk_size, overlap, min_chunk_size,
-                  target_seq_length, pad_token_id),
+        initargs=(tokenizer_path,),
     ) as pool:
-        with tqdm(total=len(txt_files), desc="Processing", unit="file") as pbar:
-            for arr, stats in pool.imap_unordered(_process_file_batch, tasks):
-                if arr.shape[0] > 0:
-                    chunk_arrays.append(arr)
+        with tqdm(total=len(txt_files), desc="Tokenizing", unit="file") as pbar:
+            for stream, stats in pool.imap_unordered(_process_file_batch, tasks):
+                if stream.shape[0] > 0:
+                    stream_parts.append(stream)
                 total_chars += stats["total_chars"]
                 total_tokens += stats["total_tokens"]
                 total_files += stats["total_files"]
-                pbar.update(len(tasks[0]) if pbar.n + len(tasks[0]) <= len(txt_files)
-                            else len(txt_files) - pbar.n)
+                pbar.update(stats["input_files"])
 
-    # Concatenate all batches
-    print(f"\nConcatenating {len(chunk_arrays):,} batches...")
-    if chunk_arrays:
-        all_chunks_array = np.concatenate(chunk_arrays, axis=0)
-        del chunk_arrays
+    # Concatenate every worker's stream into one continuous token sequence.
+    print(f"\nConcatenating {len(stream_parts):,} token streams...")
+    if stream_parts:
+        full_stream = np.concatenate(stream_parts)
+        del stream_parts
     else:
-        all_chunks_array = np.zeros((0, target_seq_length), dtype=np.int32)
+        full_stream = np.zeros((0,), dtype=np.int32)
 
-    avg_chunk_size = float((all_chunks_array != pad_token_id).sum(axis=1).mean()) if len(all_chunks_array) else 0
+    # Pack into full blocks: drop the trailing remainder that can't fill a block.
+    n_blocks = len(full_stream) // block_size
+    dropped = len(full_stream) - n_blocks * block_size
+    if n_blocks == 0:
+        raise ValueError(
+            f"Token stream ({len(full_stream)}) shorter than one block "
+            f"({block_size}). Add more data or lower block_size."
+        )
+    blocks = full_stream[:n_blocks * block_size].reshape(n_blocks, block_size)
+    del full_stream
 
     stats_out = {
         "total_files": total_files,
         "total_chars": total_chars,
         "total_tokens": total_tokens,
-        "total_chunks": int(len(all_chunks_array)),
-        "avg_chunk_size": avg_chunk_size,
-        "data_efficiency_multiplier": len(all_chunks_array) / total_files if total_files > 0 else 0,
+        "total_blocks": int(n_blocks),
+        "dropped_tokens": int(dropped),
+        "tokens_per_block": block_size,
     }
-    return all_chunks_array, stats_out
+    return blocks, stats_out
 
 
 def split_train_val(
-    chunks: np.ndarray,
+    blocks: np.ndarray,
     train_split: float = 0.9,
     seed: int = 42,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Shuffle then split into train/val.
 
-    Shuffle is critical: avoids alphabetical bias in validation.
+    Shuffle is at the block level — avoids any positional bias in validation
+    while keeping each block's internal token order (and document boundaries)
+    intact.
     """
     rng = np.random.default_rng(seed)
-    indices = np.arange(len(chunks))
+    indices = np.arange(len(blocks))
     rng.shuffle(indices)
-    split_idx = int(len(chunks) * train_split)
-    return chunks[indices[:split_idx]], chunks[indices[split_idx:]]
+    split_idx = int(len(blocks) * train_split)
+    return blocks[indices[:split_idx]], blocks[indices[split_idx:]]
 
 
-def save_dataset(chunks: np.ndarray, output_path: str):
+def save_dataset(blocks: np.ndarray, output_path: str):
     """Save numpy array as torch tensor."""
-    tensor = torch.from_numpy(chunks).long()
+    tensor = torch.from_numpy(blocks).long()
     torch.save(tensor, output_path)
     print(f"Saved {output_path}")
     print(f"  Shape: {tensor.shape}")
     print(f"  Size: {tensor.element_size() * tensor.numel() / 1024 / 1024:.2f} MB")
 
 
-def display_stats(stats: dict, train_chunks: np.ndarray, val_chunks: np.ndarray, target_seq_length: int):
+def display_stats(stats: dict, train_blocks: np.ndarray, val_blocks: np.ndarray, block_size: int):
     print("\n" + "=" * 80)
-    print("CHUNKING RESULTS")
+    print("DOCUMENT PACKING RESULTS")
     print("=" * 80)
     print(f"Total files processed:          {stats['total_files']:,}")
     print(f"Total characters:               {stats['total_chars']:,}")
-    print(f"Total tokens before chunking:   {stats['total_tokens']:,}")
-    print(f"Total chunks created:           {stats['total_chunks']:,}")
-    print(f"Average chunk size (non-pad):   {stats['avg_chunk_size']:.1f} tokens")
-    print(f"Data efficiency multiplier:     {stats['data_efficiency_multiplier']:.1f}x")
+    print(f"Total tokens (incl. bos/eos):   {stats['total_tokens']:,}")
+    print(f"Block size:                     {stats['tokens_per_block']} tokens")
+    print(f"Total full blocks created:      {stats['total_blocks']:,}")
+    print(f"Dropped trailing tokens:        {stats['dropped_tokens']:,} "
+          f"({100 * stats['dropped_tokens'] / max(stats['total_tokens'], 1):.3f}%)")
+    print(f"Padding tokens:                 0 (packing wastes no compute)")
     print()
-    print(f"Train samples:                  {len(train_chunks):,}")
-    print(f"Val samples:                    {len(val_chunks):,}")
-    print(f"Train tensor shape:             ({len(train_chunks)}, {target_seq_length})")
-    print(f"Val tensor shape:               ({len(val_chunks)}, {target_seq_length})")
+    print(f"Train samples:                  {len(train_blocks):,}")
+    print(f"Val samples:                    {len(val_blocks):,}")
+    print(f"Train tensor shape:             ({len(train_blocks)}, {block_size})")
+    print(f"Val tensor shape:               ({len(val_blocks)}, {block_size})")
     print("=" * 80)
 
 
 def main():
     print("\n" + "=" * 80)
-    print("GPT-2 DATA PREPARATION — INTELLIGENT CHUNKING (parallel + numpy)")
+    print("GPT-2 DATA PREPARATION — DOCUMENT PACKING (parallel + numpy)")
     print("=" * 80 + "\n")
 
     project_root = Path(__file__).parent.parent
@@ -264,6 +249,7 @@ def main():
 
     data_config = config["data"]
     tokenizer_config = config["tokenizer"]
+    model_config = config["model"]
 
     # Resolve paths
     for key in ["data_dir", "train_data", "val_data"]:
@@ -272,20 +258,17 @@ def main():
     if not os.path.isabs(tokenizer_config["tokenizer_path"]):
         tokenizer_config["tokenizer_path"] = str(project_root / tokenizer_config["tokenizer_path"])
 
-    chunk_size = data_config.get("chunk_size", 450)
-    chunk_overlap = data_config.get("chunk_overlap", 50)
-    min_chunk_size = data_config.get("min_chunk_size", 100)
-    target_seq_length = data_config.get("target_seq_length", 512)
+    # Block size = model context length. A "block_size" override in the data
+    # config takes precedence if present (e.g. to train on shorter contexts).
+    block_size = data_config.get("block_size", model_config.get("n_positions", 1024))
     train_split = data_config.get("train_split", 0.9)
-    pad_token_id = tokenizer_config.get("pad_token_id", 0)
+    seed = config.get("training", {}).get("seed", 42)
 
-    print(f"Chunking strategy:")
-    print(f"  Chunk size:         {chunk_size} tokens")
-    print(f"  Overlap:            {chunk_overlap} tokens")
-    print(f"  Stride:             {chunk_size - chunk_overlap} tokens")
-    print(f"  Min chunk size:     {min_chunk_size} tokens")
-    print(f"  Target seq length:  {target_seq_length} tokens")
-    print(f"  Pad token ID:       {pad_token_id}")
+    print(f"Packing strategy:")
+    print(f"  Block size:         {block_size} tokens (= model n_positions)")
+    print(f"  Special tokens:     <bos> ... <eos> around every document")
+    print(f"  Padding:            none (continuous stream packed into full blocks)")
+    print(f"  Train split:        {train_split}")
     print()
 
     print(f"Tokenizer: {tokenizer_config['tokenizer_path']}")
@@ -293,34 +276,30 @@ def main():
     print()
 
     # Process (parallel)
-    all_chunks, stats = process_all_files(
+    blocks, stats = process_all_files(
         data_dir=data_config["data_dir"],
         tokenizer_path=tokenizer_config["tokenizer_path"],
-        chunk_size=chunk_size,
-        overlap=chunk_overlap,
-        min_chunk_size=min_chunk_size,
-        target_seq_length=target_seq_length,
-        pad_token_id=pad_token_id,
+        block_size=block_size,
     )
 
-    print(f"\nTotal: {len(all_chunks):,} padded chunks "
-          f"(memory: {all_chunks.nbytes / 1024 / 1024:.1f} MB as int32)")
+    print(f"\nTotal: {len(blocks):,} full blocks "
+          f"(memory: {blocks.nbytes / 1024 / 1024:.1f} MB as int32)")
 
     # Shuffle + split
     print(f"\nShuffling and splitting (train_split={train_split})...")
-    train_chunks, val_chunks = split_train_val(all_chunks, train_split)
-    del all_chunks  # free memory
+    train_blocks, val_blocks = split_train_val(blocks, train_split, seed=seed)
+    del blocks  # free memory
 
-    print(f"Train: {len(train_chunks):,} samples")
-    print(f"Val:   {len(val_chunks):,} samples")
+    print(f"Train: {len(train_blocks):,} blocks")
+    print(f"Val:   {len(val_blocks):,} blocks")
 
     # Save
     print("\nSaving datasets...")
-    save_dataset(train_chunks, data_config["train_data"])
-    save_dataset(val_chunks, data_config["val_data"])
+    save_dataset(train_blocks, data_config["train_data"])
+    save_dataset(val_blocks, data_config["val_data"])
 
     # Stats
-    display_stats(stats, train_chunks, val_chunks, target_seq_length)
+    display_stats(stats, train_blocks, val_blocks, block_size)
     print("\nDataset preparation complete!")
 
 
