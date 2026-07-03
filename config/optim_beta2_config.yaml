@@ -1,0 +1,204 @@
+# GPT-2 Configuration
+# Optimized for GTX 1080 Ti (11GB VRAM)
+
+# Model parameters : 124M (Original GPT-2 Small)
+# model:
+#   # Architecture
+#   vocab_size: 32000
+#   n_positions: 1024  # Context length
+#   n_embd: 768        # Hidden size / embedding dimension
+#   n_layer: 12        # Number of transformer blocks
+#   n_head: 12         # Number of attention heads (768/12 = 64 dims per head)
+#   n_inner: 3072      # FFN hidden dimension (4x n_embd)
+
+# Model parameters : ~15M (modern LLaMA-style, optimal Chinchilla pour 273M tokens)
+model:
+  # Architecture
+  vocab_size: 32000
+  n_positions: 1024  # Context length
+  n_embd: 256        # Hidden size / embedding dimension
+  n_layer: 8         # Number of transformer blocks (deeper = mieux compréhension)
+  n_head: 4          # Number of attention heads (256/4 = 64 dims per head — propre)
+  n_inner: 1024      # FFN hidden dimension (4x n_embd, ajusté auto pour SwiGLU)
+
+# Model parameters : 4.56M
+# model:
+#  # Architecture
+#  vocab_size: 32000
+#  n_positions: 1024  # Context length
+#  n_embd: 128        # Hidden size / embedding dimension
+#  n_layer: 2         # Number of transformer blocks
+#  n_head: 8          # Number of attention heads (128/8 = 16 dims per head)
+#  n_inner: 384       # FFN hidden dimension (4x n_embd)
+#
+#  # Regularization
+#  embd_pdrop: 0.1    # Embedding dropout
+#  resid_pdrop: 0.1   # Residual dropout
+#  attn_pdrop: 0.1    # Attention dropout
+
+  # Label smoothing (0.0 = hard labels, 0.1 = spread 10% to other tokens)
+  # Note: 0.1 causes flat distributions on small models (<50M params), use 0.0
+  label_smoothing: 0.0
+
+  # Layer norm epsilon
+  layer_norm_epsilon: !!float 1e-5
+
+  # Activation function
+  activation_function: "gelu"
+
+  # ============================================
+  # Modern Architecture Improvements (LLaMA-style)
+  # ============================================
+  # All disabled by default for backward compatibility
+
+  # RoPE: Rotary Position Embeddings (replaces learned positional embeddings)
+  # Benefits: Better length generalization, no learned position params
+  use_rope: true
+  rope_theta: 10000.0           # Base frequency for RoPE
+  rope_scaling: null            # Scaling factor for extended context (e.g., 2.0 for 2x)
+
+  # RMSNorm: Replace LayerNorm with RMSNorm
+  # Benefits: ~10% faster, fewer parameters (no bias)
+  use_rmsnorm: true
+
+  # SwiGLU: Replace GELU MLP with SwiGLU activation
+  # Benefits: Better expressivity per parameter
+  use_swiglu: true
+
+  # Flash Attention: Uses F.scaled_dot_product_attention (PyTorch 2.0+)
+  # Benefits: ~2x faster, ~4x less VRAM on attention
+  use_flash_attention: true
+
+  # GQA: Grouped Query Attention (between MHA and MQA)
+  # Benefits: Reduces KV-cache memory, faster inference
+  use_gqa: false
+  n_kv_heads: 2                 # Number of KV heads (n_head must be divisible by this)
+                                # n_kv_heads=1 is MQA, n_kv_heads=n_head is standard MHA
+
+  # QK-Norm: Apply RMSNorm to Q and K before attention
+  # Benefits: Training stability, especially for large models
+  use_qk_norm: true
+
+  # Legacy flag (use use_gqa + n_kv_heads=1 instead)
+  use_mqa: false
+
+training:
+  # Batch configuration
+  batch_size: 16             # Per-device batch size
+  gradient_accumulation_steps: 4  # Effective batch = 64 (stable training)
+
+  # Optimization
+  learning_rate: !!float 5e-4  # Learning rate
+  weight_decay: 0.01
+  max_grad_norm: 1.0          # Gradient clipping
+  # Test optimizer (façon d'apprendre) : beta2 LLaMA/GPT-3 au lieu du défaut
+  # PyTorch (0.999). beta2 plus bas réagit plus vite aux changements de gradient.
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+
+  # Learning rate schedule
+  lr_scheduler: "cosine"      # cosine or linear
+  warmup_ratio: 0.07          # Warmup as % of total training steps (7% is standard for LLMs)
+
+  # Training steps
+  max_steps: 100000           # Total training steps
+  eval_interval: 500          # Evaluate every N steps
+  save_interval: 2000         # Save checkpoint every N steps
+  save_interval_epochs: 2     # Save checkpoint every N epochs
+
+  # Epochs (alternative to max_steps)
+  num_epochs: 10              # Short test run to validate document packing
+                            # (restore to 20 for the real run once validated)
+
+  # Mixed precision
+  use_fp16: true              # Enable mixed precision training
+
+  # Gradient checkpointing (saves ~2-3x VRAM at cost of ~2x speed)
+  # Disabled: 44M model fits in 11GB without it
+  gradient_checkpointing: false
+
+  # Early stopping
+  early_stopping_patience: 3
+
+  # Seed for reproducibility
+  seed: 42
+
+data:
+  # Data paths
+  data_dir: "data"
+  train_data: "data/train.pt"
+  val_data: "data/val.pt"
+
+  # Preprocessing - Document Packing (GPT-3 / LLaMA style)
+  # Documents are wrapped in <bos> ... <eos>, concatenated into one continuous
+  # stream, then sliced into FULL blocks of block_size (no padding, no
+  # mid-sentence cuts). This is what teaches long-range coherence.
+  block_size: 768             # Training sequence length (<= n_positions=1024)
+  train_split: 0.9            # 90% train, 10% validation
+  data_fraction: 1.0          # Fraction of TRAIN blocks to use (1.0 = all).
+                              # Set <1.0 (e.g. 0.2) for fast validation runs.
+                              # Override on the CLI: --data-fraction 0.2
+
+  # DataLoader settings
+  num_workers: 4
+  pin_memory: true
+
+tokenizer:
+  # Tokenizer configuration
+  tokenizer_path: "bpe_tokenizer_32k.json"
+
+  # Special tokens
+  pad_token: "<pad>"
+  unk_token: "<unk>"
+  bos_token: "<bos>"
+  eos_token: "<eos>"
+
+  # Token IDs (from tokenizer JSON)
+  pad_token_id: 0
+  unk_token_id: 1
+  bos_token_id: 2
+  eos_token_id: 3
+
+generation:
+  # Generation settings for inference.
+  # Tuned via scripts/tune_sampling.py on the 15M model: rep_pen 1.3 + top_k 40
+  # roughly doubled coherence_len (38 -> 76) and killed repetition, while
+  # keeping the text natural. repetition_penalty is the key lever here.
+  max_length: 512
+  temperature: 0.8
+  top_k: 40
+  top_p: 0.9              # Nucleus sampling
+  repetition_penalty: 1.3
+  do_sample: true
+  use_cache: true         # KV-cache for faster generation (5-10x speedup)
+
+logging:
+  # Logging and checkpointing
+  log_dir: "logs"
+  checkpoint_dir: "models_optim_beta2"   # test optimizer beta2=0.95 (séparé du baseline)
+  run_name: "optim_beta2_095"
+
+  # Weights & Biases (optional)
+  use_wandb: false
+  wandb_project: "gpt2-from-scratch"
+  wandb_entity: null
+
+multiphase:
+  # Phase 1 — Denoising CLM: corrupt input, predict clean tokens
+  phase1_epochs: 3
+  corruption_rate: 0.15         # 15% of tokens corrupted
+
+  # Phase 2 — Curriculum CLM: easy data first, hard data last
+  phase2_epochs: 10
+  num_curriculum_buckets: 5     # 5 difficulty levels (cumulative)
+
+  # Phase 3 — CLM + Contrastive: tighten embedding space
+  phase3_epochs: 5
+  contrastive_weight: 0.1       # Weight of contrastive loss vs CLM
+  contrastive_temperature: 0.05 # InfoNCE temperature
+
+system:
+  # Hardware
+  device: "cuda"
+  compile_model: false        # torch.compile (PyTorch 2.0+)
+  flash_attention: false      # Requires flash-attn package
