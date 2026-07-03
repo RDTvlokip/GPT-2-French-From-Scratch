@@ -18,7 +18,7 @@ Three recurrent-depth variants trained with this framework, on the Hub (Apache-2
 
 > ⚠️ **Preliminary — 1 seed, variance not controlled.** These are research artifacts, not benchmarked models.
 
-**Write-ups**: [1 · I trained my own French LLM from scratch](https://huggingface.co/blog/RDTvlokip/i-trained-my-own-french-llm-from-scratch) · [2 · Architecture is a threshold, not a lever](https://huggingface.co/blog/RDTvlokip/what-i-learned-optimizing-a-15m-french) · [3 · Teaching a 15M LLM to think deeper](https://huggingface.co/blog/RDTvlokip/teaching-my-llm-to-think-deeper)
+**Write-ups**: [1 · I trained my own French LLM from scratch](https://huggingface.co/blog/RDTvlokip/i-trained-my-own-french-llm-from-scratch) · [2 · Architecture is a threshold, not a lever](https://huggingface.co/blog/RDTvlokip/what-i-learned-optimizing-a-15m-french) · [3 · Teaching a 15M LLM to think deeper](https://huggingface.co/blog/RDTvlokip/teaching-a-15m-french-llm-to-think-deeper)
 
 ---
 
