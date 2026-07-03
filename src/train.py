@@ -43,6 +43,42 @@ from model.gpt2 import GPT2, GPT2Config
 
 
 
+class Lion(torch.optim.Optimizer):
+    """Lion optimizer (Chen et al. 2023, "Symbolic Discovery of Optimization
+    Algorithms"). Update = sign of an interpolation of the momentum, so update
+    magnitude is constant -> needs a LR ~3-10x SMALLER than AdamW and often a
+    larger weight_decay. Simpler and lighter than Adam (1 state tensor vs 2).
+
+    update_t = sign( (1-β1)·g_t + β1·m_{t-1} )
+    m_t      = (1-β2)·g_t + β2·m_{t-1}
+    """
+
+    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0):
+        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = closure() if closure is not None else None
+        for group in self.param_groups:
+            lr, (b1, b2), wd = group["lr"], group["betas"], group["weight_decay"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                state = self.state[p]
+                if "m" not in state:
+                    state["m"] = torch.zeros_like(p)
+                m = state["m"]
+                # decoupled weight decay
+                if wd != 0:
+                    p.mul_(1 - lr * wd)
+                update = m.mul(b1).add_(g, alpha=1 - b1).sign_()
+                p.add_(update, alpha=-lr)
+                m.mul_(b2).add_(g, alpha=1 - b2)
+        return loss
+
+
 def compute_gradient_stats(model):
     """Compute the global gradient L2 norm (logged per epoch in metrics.csv)."""
     total_norm = 0.0
@@ -225,12 +261,27 @@ class Trainer:
         print(f"Config training: {config['training']}")
         print(f"LR: {config['training']['learning_rate']} (type: {type(config['training']['learning_rate'])})")
 
-        # Initialize optimizer
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=config["training"]["learning_rate"],
-            weight_decay=config["training"]["weight_decay"],
-        )
+        # Initialize optimizer. Selectable via config (optimizer: adamw|lion)
+        # to experiment with the "how it learns" axis.
+        opt_name = config["training"].get("optimizer", "adamw").lower()
+        lr = config["training"]["learning_rate"]
+        wd = config["training"]["weight_decay"]
+        if opt_name == "lion":
+            # Lion needs a much smaller LR than AdamW (sign-based updates).
+            beta1 = config["training"].get("lion_beta1", 0.9)
+            beta2 = config["training"].get("lion_beta2", 0.99)
+            self.optimizer = Lion(self.model.parameters(), lr=lr,
+                                  betas=(beta1, beta2), weight_decay=wd)
+            print(f"Optimizer: Lion (lr={lr}, betas=({beta1},{beta2}), wd={wd}) "
+                  f"-- ATTENTION: Lion veut un LR ~3-10x plus petit qu'AdamW")
+        else:
+            beta1 = config["training"].get("adam_beta1", 0.9)
+            beta2 = config["training"].get("adam_beta2", 0.999)
+            self.optimizer = torch.optim.AdamW(
+                self.model.parameters(), lr=lr, weight_decay=wd,
+                betas=(beta1, beta2),
+            )
+            print(f"Optimizer: AdamW (lr={lr}, betas=({beta1},{beta2}), wd={wd})")
 
         # Calculate total training steps
         steps_per_epoch = len(self.train_loader) // config["training"]["gradient_accumulation_steps"]
@@ -508,6 +559,57 @@ class Trainer:
             checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch}.pt"
             self.model.save_pretrained(str(checkpoint_path))
 
+    def save_resume_state(self, epoch: int):
+        """Save a FULL training state so a run can resume exactly after a crash
+        (power outage, Ctrl+C...). Unlike best_model.pt (weights only), this
+        keeps the optimizer, scheduler, epoch, best-val tracking and RNG state.
+        Overwrites resume.pt each epoch (single rolling file).
+        """
+        checkpoint_dir = Path(self.config["logging"]["checkpoint_dir"])
+        resume_path = checkpoint_dir / "resume.pt"
+        state = {
+            "epoch": epoch,                       # last COMPLETED epoch (1-based)
+            "model_state_dict": self.model.state_dict(),
+            "config": self.model.config,
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "global_step": getattr(self, "global_step", 0),
+            "best_val_loss": self.best_val_loss,
+            "best_epoch": self.best_epoch,
+            "patience_counter": self.patience_counter,
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        }
+        # Write to a temp file then rename: a crash mid-write can't corrupt the
+        # existing resume.pt.
+        tmp = checkpoint_dir / "resume.pt.tmp"
+        torch.save(state, tmp)
+        os.replace(tmp, resume_path)
+
+    def load_resume_state(self):
+        """Load resume.pt if present. Returns the epoch to start from (0 if none)."""
+        resume_path = Path(self.config["logging"]["checkpoint_dir"]) / "resume.pt"
+        if not resume_path.exists():
+            return 0
+        print(f"\n[Resume] Found {resume_path}, restoring full training state...")
+        ckpt = torch.load(resume_path, map_location=self.device, weights_only=False)
+        self.model.load_state_dict(ckpt["model_state_dict"])
+        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        self.global_step = ckpt.get("global_step", 0)
+        self.best_val_loss = ckpt["best_val_loss"]
+        self.best_epoch = ckpt["best_epoch"]
+        self.patience_counter = ckpt["patience_counter"]
+        try:
+            torch.set_rng_state(ckpt["torch_rng_state"])
+            if ckpt.get("cuda_rng_state") is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(ckpt["cuda_rng_state"])
+        except Exception:
+            pass
+        start = ckpt["epoch"]  # resume AFTER this completed epoch
+        print(f"[Resume] Resuming from epoch {start + 1} "
+              f"(best val_loss so far: {self.best_val_loss:.4f} at epoch {self.best_epoch})")
+        return start
 
     def train(self):
         """Main training loop."""
@@ -519,7 +621,11 @@ class Trainer:
         patience = self.config["training"]["early_stopping_patience"]
         early_stopped = False
 
-        epochs_pbar = tqdm(range(num_epochs), desc="Training", unit="epoch", colour="green")
+        # Resume from a previous crash if resume.pt exists (full state restored).
+        start_epoch = self.load_resume_state()
+
+        epochs_pbar = tqdm(range(start_epoch, num_epochs), desc="Training",
+                           unit="epoch", colour="green")
 
         for epoch in epochs_pbar:
             self.epoch = epoch
@@ -578,6 +684,9 @@ class Trainer:
                     print(f"{'='*80}\n")
                     early_stopped = True
                     break
+
+            # Save full resume state after each completed epoch (crash-safe).
+            self.save_resume_state(epoch=epoch + 1)
 
             print(f"{'='*80}\n")
 

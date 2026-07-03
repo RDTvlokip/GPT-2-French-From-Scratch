@@ -65,6 +65,54 @@ class GPT2Config:
     # Flash Attention (uses F.scaled_dot_product_attention)
     use_flash_attention: bool = False
 
+    # LayerScale (CaiT, Touvron et al. 2021): a learned per-channel scalar
+    # gamma multiplies each sub-block output before the residual add, init
+    # very small so blocks start near-identity and "open up" gradually.
+    # Stabilizes small models on noisy (hapax) corpora. Near-zero param cost.
+    use_layerscale: bool = False
+    layerscale_init: float = 1e-4
+
+    # Recurrent-depth / looped transformer (Geiping 2025; Kohli et al. COLM 2026;
+    # Chen NCU 2026). The n_layer blocks are applied R times in a loop, giving an
+    # effective depth of n_layer * recurrence WITHOUT adding parameters. A learned
+    # per-step depth embedding is injected before each iteration so the shared
+    # block can tell iterations apart. Pairs with use_layerscale + zero-init
+    # c_proj (block starts as identity) for stable unrolling. recurrence=1 is the
+    # standard (non-looped) model.
+    recurrence: int = 1
+    # Zero-init the residual output projections (attn c_proj + MLP down_proj) so
+    # each block is an exact identity map at init — critical for stable looping
+    # (Kohli et al. show default Gaussian init is seed-unstable when looped).
+    zero_init_residual: bool = False
+    # Adaptive per-token halting (INFERENCE-time, idea originale Théo): during the
+    # recurrent loop, freeze tokens whose output entropy drops below a threshold
+    # (easy tokens like "le","de" stop early; rare/hapax tokens loop the full R).
+    # Zero added params (entropy computed from existing logits). Only active when
+    # recurrence > 1. See idee-profondeur-adaptative-par-token.
+    adaptive_halting: bool = False
+    halting_entropy_threshold: float = 1.0  # nats; token freezes when H(logits) < this
+    # Halting threshold mode:
+    #  "absolute"   — freeze when entropy < halting_entropy_threshold (fixed nats).
+    #                 Simple, but the right value depends on model size (a bigger
+    #                 model is more confident → lower entropy → freezes too early).
+    #  "percentile" — freeze the q fraction of still-active tokens with the LOWEST
+    #                 entropy each iteration (q = halting_percentile). Recomputes
+    #                 the cutoff from the live entropy distribution, so it is
+    #                 INVARIANT to model size — q transfers across scales.
+    halting_mode: str = "absolute"  # "absolute" | "percentile"
+    halting_percentile: float = 0.3  # q: fraction of active tokens to freeze/iter
+    # Option B: also apply halting DURING TRAINING, so the model learns to give a
+    # good answer at whatever depth each token halts (easy tokens learn to be good
+    # at R=1-2, hapax keep looping). Without this, halting-at-inference under-computes
+    # (the model was only ever good at fixed R). Idea originale Théo.
+    halting_in_training: bool = False
+
+    # Multi-token prediction (Gloeckle et al. / DeepSeek-V3): a 2nd head also
+    # predicts token t+2, forcing richer representations. Only affects training
+    # (the extra loss); generation still uses the main t+1 head.
+    use_multi_token: bool = False
+    multi_token_weight: float = 0.3  # weight λ of the t+2 loss term
+
     # RoPE configuration
     rope_theta: float = 10000.0  # Base frequency for RoPE
     rope_scaling: Optional[float] = None  # Scaling factor for extended context
@@ -520,6 +568,16 @@ class TransformerBlock(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
 
+        # LayerScale: per-channel learned gain on each sub-block output.
+        self.use_layerscale = config.use_layerscale
+        if config.use_layerscale:
+            self.gamma_1 = nn.Parameter(
+                torch.full((config.n_embd,), config.layerscale_init)
+            )
+            self.gamma_2 = nn.Parameter(
+                torch.full((config.n_embd,), config.layerscale_init)
+            )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -552,6 +610,8 @@ class TransformerBlock(nn.Module):
                 past_key_value,
                 use_cache,
                 use_reentrant=False,
+                preserve_rng_state=True,
+                determinism_check="none",
             )
         else:
             attn_output, present_key_value = self.attn(
@@ -561,15 +621,21 @@ class TransformerBlock(nn.Module):
                 past_key_value=past_key_value,
                 use_cache=use_cache,
             )
+        if self.use_layerscale:
+            attn_output = self.gamma_1 * attn_output
         x = x + attn_output
 
         # Pre-norm MLP
         if self.training and self.gradient_checkpointing:
-            x = x + torch.utils.checkpoint.checkpoint(
+            mlp_output = torch.utils.checkpoint.checkpoint(
                 self.mlp, self.ln_2(x), use_reentrant=False,
+                preserve_rng_state=True, determinism_check="none",
             )
         else:
-            x = x + self.mlp(self.ln_2(x))
+            mlp_output = self.mlp(self.ln_2(x))
+        if self.use_layerscale:
+            mlp_output = self.gamma_2 * mlp_output
+        x = x + mlp_output
 
         return x, present_key_value
 
@@ -609,19 +675,35 @@ class GPT2(nn.Module):
         if wpe is not None:
             self.transformer["wpe"] = wpe
 
+        # Recurrent-depth: learned per-iteration depth embedding (broadcast over
+        # all positions), injected before each loop pass so the shared block can
+        # distinguish iterations. Only needed when looping (recurrence > 1).
+        if config.recurrence > 1:
+            self.transformer["depth_emb"] = nn.Embedding(config.recurrence, config.n_embd)
+
         # Language modeling head
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # Optional 2nd head predicting token t+2 (multi-token prediction).
+        # Separate, untied head — only used to add a training loss term.
+        if config.use_multi_token:
+            self.lm_head2 = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # Initialize weights first, then tie (so tying survives init)
         self.apply(self._init_weights)
 
-        # GPT-2 scaled init: shrink the residual output projections by
-        # 1/sqrt(2 * n_layer) so the residual stream variance stays bounded
-        # with depth. Applied to attn output proj and MLP down proj.
+        # Residual output projections (attn c_proj + MLP down_proj):
+        # - zero_init_residual: init to exactly 0 → each block is an identity map
+        #   at start. Required for stable recurrent-depth looping (Kohli et al.).
+        # - otherwise GPT-2 scaled init: std = 0.02 / sqrt(2 * n_layer) to keep
+        #   the residual-stream variance bounded with depth.
         scale = (2 * config.n_layer) ** -0.5
         for name, p in self.named_parameters():
             if name.endswith("c_proj.weight") or name.endswith("down_proj.weight"):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02 * scale)
+                if config.zero_init_residual:
+                    torch.nn.init.zeros_(p)
+                else:
+                    torch.nn.init.normal_(p, mean=0.0, std=0.02 * scale)
 
         # Weight tying (after init to avoid double-init of the shared tensor)
         self.transformer.wte.weight = self.lm_head.weight
@@ -711,22 +793,90 @@ class GPT2(nn.Module):
 
         x = self.transformer.drop(x)
 
-        # Transformer blocks with optional caching
+        # Recurrent-depth: apply the stack of blocks `recurrence` times, injecting
+        # a per-iteration depth embedding first so the shared blocks can tell
+        # iterations apart. recurrence=1 is the plain (non-looped) forward.
+        # KV-cache is only meaningful on the LAST iteration (the one whose K/V are
+        # reused at the next decode step); intermediate iterations don't cache.
+        R = self.config.recurrence
+        # KV-cache across a looped forward is not yet supported (the shared blocks
+        # would need a separate cache slot per iteration). Looping is used in
+        # training and in cache-free eval (evaluate.py), which is enough to test
+        # the idea. Fall back cleanly if someone requests both.
+        if R > 1 and use_cache:
+            raise NotImplementedError(
+                "KV-cache is not supported with recurrence > 1; call with use_cache=False."
+            )
         present_key_values = [] if use_cache else None
 
-        for i, block in enumerate(self.transformer.h):
-            past_kv = past_key_values[i] if past_key_values is not None else None
+        # depth_emb table has `config.recurrence` rows. Allow R (may be raised at
+        # inference for "thinking longer") to exceed it by clamping the index to
+        # the last learned depth embedding.
+        n_depth = self.transformer.depth_emb.num_embeddings if R > 1 else 0
 
-            x, present_kv = block(
-                x,
-                attention_mask=attention_mask,
-                position_ids=position_ids if self.config.use_rope else None,
-                past_key_value=past_kv,
-                use_cache=use_cache,
-            )
+        # Adaptive per-token halting (inference only): a token freezes once its
+        # output entropy is low enough (easy tokens stop early, hapax loop the
+        # full R). `frozen` holds the final state of halted tokens; `x` carries
+        # the still-active computation. Frozen tokens keep serving as K/V.
+        # Active at inference always; at training only if halting_in_training (Option B).
+        halting = self.config.adaptive_halting and R > 1 and (
+            not self.training or self.config.halting_in_training
+        )
+        frozen = None  # (B, T, C) state of halted tokens, NaN where still active
+        if halting:
+            frozen = torch.full_like(x, float("nan"))
 
-            if use_cache:
-                present_key_values.append(present_kv)
+        for r in range(R):
+            if R > 1:
+                idx = min(r, n_depth - 1)
+                depth_vec = self.transformer.depth_emb(torch.tensor(idx, device=device))
+                x = x + depth_vec  # broadcast over (B, T, n_embd)
+
+            for i, block in enumerate(self.transformer.h):
+                past_kv = past_key_values[i] if past_key_values is not None else None
+
+                x, present_kv = block(
+                    x,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids if self.config.use_rope else None,
+                    past_key_value=past_kv,
+                    use_cache=use_cache,
+                )
+
+                if use_cache:
+                    present_key_values.append(present_kv)
+
+            if halting:
+                # Restore already-frozen tokens to their halt-time state so later
+                # iterations neither advance them nor let them drift.
+                was_frozen = ~torch.isnan(frozen[..., :1])  # (B,T,1)
+                x = torch.where(was_frozen, frozen, x)
+                if r < R - 1:
+                    # Freeze newly-confident tokens.
+                    probs = F.softmax(self.lm_head(self.transformer.ln_f(x)), dim=-1)
+                    entropy = -(probs * torch.log(probs + 1e-9)).sum(-1, keepdim=True)
+                    active = ~was_frozen  # (B,T,1)
+                    if self.config.halting_mode == "percentile":
+                        # Size-invariant cutoff: each iteration, freeze the q
+                        # fraction of still-active tokens with the LOWEST entropy,
+                        # per sequence. The cutoff is the q-quantile of the ACTIVE
+                        # tokens' entropies only (frozen ones are excluded, so they
+                        # can't skew the quantile). q transfers across model sizes.
+                        q = self.config.halting_percentile
+                        ent = entropy.squeeze(-1)      # (B, T)
+                        act = active.squeeze(-1)        # (B, T) bool
+                        newly = torch.zeros_like(act)   # (B, T)
+                        for b in range(ent.size(0)):
+                            vals = ent[b][act[b]]       # entropies of active tokens in seq b
+                            if vals.numel() == 0:
+                                continue
+                            cutoff = torch.quantile(vals, q)
+                            newly[b] = act[b] & (ent[b] <= cutoff)
+                        newly = newly.unsqueeze(-1)     # (B, T, 1)
+                    else:
+                        # Absolute threshold (default): fixed entropy cutoff in nats.
+                        newly = (entropy < self.config.halting_entropy_threshold) & active
+                    frozen = torch.where(newly, x, frozen)
 
         # Final normalization
         x = self.transformer.ln_f(x)
@@ -738,6 +888,7 @@ class GPT2(nn.Module):
         # Loss computation
         loss = None
         if labels is not None:
+            # Main objective: predict t+1.
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = F.cross_entropy(
@@ -746,6 +897,21 @@ class GPT2(nn.Module):
                 label_smoothing=self.config.label_smoothing,
                 ignore_index=self.config.pad_token_id,
             )
+
+            # Auxiliary objective: a 2nd head predicts t+2 from the same
+            # hidden state, forcing the representation to "look further".
+            # Only adds a training-time loss term; generation is unchanged.
+            if self.config.use_multi_token and hasattr(self, "lm_head2"):
+                logits2 = self.lm_head2(x)
+                shift_logits2 = logits2[..., :-2, :].contiguous()
+                shift_labels2 = labels[..., 2:].contiguous()
+                loss2 = F.cross_entropy(
+                    shift_logits2.view(-1, shift_logits2.size(-1)),
+                    shift_labels2.view(-1),
+                    label_smoothing=self.config.label_smoothing,
+                    ignore_index=self.config.pad_token_id,
+                )
+                loss = loss + self.config.multi_token_weight * loss2
 
         return logits, loss, hidden_states, present_key_values
 
@@ -830,6 +996,10 @@ class GPT2(nn.Module):
         """
         training = self.training
         self.eval()
+
+        # KV-cache is incompatible with recurrent-depth looping (see forward).
+        if self.config.recurrence > 1:
+            use_cache = False
 
         past_key_values = None
 
